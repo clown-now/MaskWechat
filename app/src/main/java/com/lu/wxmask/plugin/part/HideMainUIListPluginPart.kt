@@ -25,21 +25,15 @@ import java.lang.reflect.Modifier
 /**
  * 主页UI（微信Tab消息列表）处理插件
  * 
- * 逆向分析成果（针对微信 8.0.76，VersionCode: 3140）：
- * 1. 混淆类名：MainUI 中的消息列表适配器实际类名为 `fh5.w0`（继承自 android.widget.BaseAdapter）。
- * 2. 内部数据存储：getItem(pos) / f(pos) 返回的对象是 `com.tencent.mm.storage.k4`。
- * 3. 继承层次：`com.tencent.mm.storage.k4` -> `pp.a` -> `dm.j2`。
- * 4. 关键字段验证：`dm.j2` 中完整包含 BaseConversation 的核心业务字段：
- *    - `field_username` (String)
- *    - `field_content` (String)
- *    - `field_digest` (String)
- *    - `field_unReadCount` (int)
- *    - `field_UnReadInvite` (int)
- *    - `field_unReadMuteCount` (int)
- *    - `field_msgType` (String/int)
- *    - `field_conversationTime` (long)
- * 5. 方法映射：
- *    - 8.0.76 下 `fh5.w0` 获取 item 的具体方法名为 `f`（参数为 int，返回 k4），同时覆写了标准 `getItem`。
+ * 8.0.76 深入逆向结论：
+ * 1. 适配器类：fh5.w0 (继承自 BaseAdapter)
+ * 2. 数据流转换：k4 (底层会话实体) -> fh5.x (UI包装实体) -> fh5.g0.a() 绑定到 ViewHolder (fh5.n) -> TextView
+ * 3. 为什么之前仍显示最后一条消息：
+ *    微信 8.0.76 会把会话数据包装进 `fh5.x`，并在 getView 中使用 `fh5.x.g`、`fh5.x.h` 作为消息摘要/正文渲染。
+ * 4. 解决策略：
+ *    - 策略 A：拦截并清空 getItem / f(pos) 返回的 k4 实体的字段
+ *    - 策略 B：拦截 adapter.getView，在视图返回后直接将 ViewHolder 或 View 树中的最后一条消息和红点彻底隐藏/清空
+ *    - 策略 C：拦截数据源模型 fh5.x 中的文本字段
  */
 class HideMainUIListPluginPart : IPlugin {
 
@@ -52,7 +46,7 @@ class HideMainUIListPluginPart : IPlugin {
         Constrant.WX_CODE_8_0_53 -> "m"
         Constrant.WX_CODE_8_0_58 -> "m"
         Constrant.WX_CODE_8_0_60 -> "m"
-        Constrant.WX_CODE_8_0_76 -> "f" // 8.0.76 精确逆向出的方法名
+        Constrant.WX_CODE_8_0_76 -> "f" // 8.0.76
         else -> "f"
     }
 
@@ -75,7 +69,7 @@ class HideMainUIListPluginPart : IPlugin {
             in Constrant.WX_CODE_8_0_43..Constrant.WX_CODE_8_0_47,
             Constrant.WX_CODE_PLAY_8_0_48, Constrant.WX_CODE_8_0_50, Constrant.WX_CODE_8_0_51, Constrant.WX_CODE_8_0_53, Constrant.WX_CODE_8_0_56 -> "com.tencent.mm.ui.i3"
             in Constrant.WX_CODE_8_0_58..Constrant.WX_CODE_8_0_60 -> "com.tencent.mm.ui.k3"
-            Constrant.WX_CODE_8_0_76 -> "fh5.w0" // 8.0.76 精确反编译定位到的 Adapter 类
+            Constrant.WX_CODE_8_0_76 -> "fh5.w0"
             else -> null
         }
 
@@ -83,6 +77,9 @@ class HideMainUIListPluginPart : IPlugin {
         if (adapterClazzName != null) {
             val adapterClass = ClazzN.from(adapterClazzName, context.classLoader)
             getItemMethod = findGetItemMethod(adapterClass)
+            
+            // 8.0.76 强力双重 Hook：不仅 hook 数据模型，还直接 hook getView 渲染
+            hookAdapterGetView(adapterClass)
         }
 
         if (getItemMethod != null) {
@@ -110,8 +107,8 @@ class HideMainUIListPluginPart : IPlugin {
 
                     if (isHooked) return
 
-                    // 兼容旧包名前缀与 8.0.76 的混淆包名
                     if (adapterClassName.startsWith("com.tencent.mm.ui.conversation") || adapterClassName == "fh5.w0") {
+                        hookAdapterGetView(adapter.javaClass)
                         var m = findGetItemMethod(adapter.javaClass)
                         if (m == null && adapter.javaClass.superclass != null) {
                             m = findGetItemMethod(adapter.javaClass.superclass)
@@ -123,8 +120,6 @@ class HideMainUIListPluginPart : IPlugin {
                             LogUtil.i("Dynamic hook getItem method succeeded: $m")
                             hookListViewGetItem(m)
                             isHooked = true
-                        } else {
-                            LogUtil.w("Failed to resolve getItem method dynamically on adapter $adapterClassName")
                         }
                     }
                 }
@@ -132,18 +127,120 @@ class HideMainUIListPluginPart : IPlugin {
         )
     }
 
+    private fun hookAdapterGetView(adapterClazz: Class<*>?) {
+        if (adapterClazz == null) return
+        val getViewMethod = XposedHelpers2.findMethodExactIfExists(
+            adapterClazz,
+            "getView",
+            Integer.TYPE,
+            View::class.java,
+            ViewGroup::class.java
+        ) ?: return
+
+        val methodSign = getViewMethod.toString()
+        if (MainHook.uniqueMetaStore.contains(methodSign)) {
+            return
+        }
+
+        XposedHelpers2.hookMethod(
+            getViewMethod,
+            object : XC_MethodHook2() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val itemView = param.result as? View ?: return
+                    val tag = itemView.tag ?: return
+
+                    // 获取用户名
+                    var chatUser: String? = null
+                    try {
+                        // 优先从 tag 中的 ViewHolder 提取或 tag 关联对象提取
+                        val conv = XposedHelpers2.getObjectField<Any?>(tag, "d")
+                        if (conv != null) {
+                            chatUser = XposedHelpers2.getObjectField<String?>(conv, "field_username")
+                        }
+                    } catch (e: Throwable) {
+                    }
+
+                    if (chatUser.isNullOrEmpty()) {
+                        try {
+                            chatUser = XposedHelpers2.getObjectField<String?>(tag, "field_username")
+                        } catch (e: Throwable) {
+                        }
+                    }
+
+                    if (chatUser.isNullOrEmpty()) {
+                        // 通过 adapter 获取当前 position 的 item
+                        try {
+                            val pos = param.args[0] as Int
+                            val item = XposedHelpers2.callMethod<Any?>(param.thisObject, GetItemMethodName, pos)
+                                ?: XposedHelpers2.callMethod<Any?>(param.thisObject, "getItem", pos)
+                            if (item != null) {
+                                chatUser = XposedHelpers2.getObjectField<String?>(item, "field_username")
+                            }
+                        } catch (e: Throwable) {
+                        }
+                    }
+
+                    if (chatUser != null && WXMaskPlugin.containChatUser(chatUser)) {
+                        maskItemViews(itemView, tag)
+                    }
+                }
+            }
+        )
+        MainHook.uniqueMetaStore.add(methodSign)
+        LogUtil.i("Successfully hooked getView method: $methodSign")
+    }
+
+    private fun maskItemViews(itemView: View, tag: Any) {
+        try {
+            // 1. 针对 ViewHolder (fh5.n) 进行直接抹除
+            // f 字段是最后一条消息 NoMeasuredTextView
+            try {
+                val lastMsgView = XposedHelpers2.getObjectField<Any?>(tag, "f")
+                if (lastMsgView != null) {
+                    XposedHelpers2.callMethod<Any?>(lastMsgView, "setText", "")
+                    (lastMsgView as? View)?.visibility = View.INVISIBLE
+                }
+            } catch (e: Throwable) {
+            }
+
+            // e 字段是草稿/状态提示 TextView
+            try {
+                val statusTv = XposedHelpers2.getObjectField<TextView?>(tag, "e")
+                statusTv?.text = ""
+                statusTv?.visibility = View.INVISIBLE
+            } catch (e: Throwable) {
+            }
+
+            // g 字段是未读消息红点 TextView
+            try {
+                val tipTv = XposedHelpers2.getObjectField<TextView?>(tag, "g")
+                tipTv?.visibility = View.INVISIBLE
+            } catch (e: Throwable) {
+            }
+
+            // 2. 通用 View 递归查找抹除最后一条消息控件
+            val tipTvId = ResUtil.getViewId("kmv")
+            if (tipTvId != 0) {
+                itemView.findViewById<View>(tipTvId)?.visibility = View.INVISIBLE
+            }
+            val lastMsgId = ResUtil.getViewId("ht5")
+            if (lastMsgId != 0) {
+                itemView.findViewById<View>(lastMsgId)?.visibility = View.INVISIBLE
+            }
+        } catch (e: Throwable) {
+            LogUtil.w("maskItemViews error: ", e)
+        }
+    }
+
     private fun findGetItemMethod(adapterClazz: Class<*>?): Method? {
         if (adapterClazz == null) return null
 
-        // 1. 精确名称查找
         var method: Method? = XposedHelpers2.findMethodExactIfExists(adapterClazz, GetItemMethodName, Integer.TYPE)
         if (method != null) return method
 
-        // 2. 查找标准 getItem(int)
         method = XposedHelpers2.findMethodExactIfExists(adapterClazz, "getItem", Integer.TYPE)
         if (method != null) return method
 
-        // 3. 特征查找：接收单个 int 参数且返回非基础类型的 public 非抽象方法
         val methods = XposedHelpers2.findMethodsByExactPredicate(adapterClazz) { m ->
             val isPrimitiveOrVoid = arrayOf(
                 Object::class.java,
@@ -185,7 +282,6 @@ class HideMainUIListPluginPart : IPlugin {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val itemData: Any = param.result ?: return
 
-                    // 获取聊天会话对应用户名
                     val chatUser: String? = try {
                         XposedHelpers2.getObjectField(itemData, "field_username")
                     } catch (e: Throwable) {
@@ -196,11 +292,9 @@ class HideMainUIListPluginPart : IPlugin {
                         return
                     }
 
-                    // 目标命中隐藏列表
                     if (WXMaskPlugin.containChatUser(chatUser)) {
                         val option = ConfigUtil.getOptionData()
 
-                        // 会话变脸/伪装
                         if (option.enableMapConversation) {
                             WXMaskPlugin.getMaskBeamById(chatUser)?.let {
                                 try {
@@ -211,20 +305,17 @@ class HideMainUIListPluginPart : IPlugin {
                             }
                         }
 
-                        // 抹除主页消息预览、红点计数
                         try {
                             XposedHelpers2.setObjectField(itemData, "field_content", "")
                             XposedHelpers2.setObjectField(itemData, "field_digest", "")
                             XposedHelpers2.setObjectField(itemData, "field_unReadCount", 0)
                             XposedHelpers2.setObjectField(itemData, "field_UnReadInvite", 0)
                             XposedHelpers2.setObjectField(itemData, "field_unReadMuteCount", 0)
-                            // 标记为普通文本，防止渲染表情或系统草稿
                             XposedHelpers2.setObjectField(itemData, "field_msgType", "1")
                         } catch (e: Throwable) {
                             LogUtil.w("Mask fields error: ", e)
                         }
 
-                        // 时间穿越实验性功能
                         if (option.enableTravelTime && option.travelTime != 0L) {
                             try {
                                 val cTime = XposedHelpers2.getObjectField<Any>(itemData, "field_conversationTime")
