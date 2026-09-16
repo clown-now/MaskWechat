@@ -12,7 +12,6 @@ import com.lu.lposed.plugin.IPlugin
 import com.lu.magic.util.ResUtil
 import com.lu.wxmask.util.ext.getViewId
 import com.lu.magic.util.log.LogUtil
-import com.lu.magic.util.view.ChildDeepCheck
 import com.lu.wxmask.ClazzN
 import com.lu.wxmask.Constrant
 import com.lu.wxmask.MainHook
@@ -26,15 +25,14 @@ import java.lang.reflect.Modifier
 /**
  * 主页UI（微信Tab消息列表）处理插件
  * 
- * 8.0.76 深入逆向结论：
- * 1. 适配器类：fh5.w0 (继承自 BaseAdapter)
- * 2. 数据流转换：k4 (底层会话实体) -> fh5.x (UI包装实体) -> fh5.g0.a() 绑定到 ViewHolder (fh5.n) -> TextView
- * 3. 为什么之前仍显示最后一条消息：
- *    微信 8.0.76 会把会话数据包装进 `fh5.x`，并在 getView 中使用 `fh5.x.g`、`fh5.x.h` 作为消息摘要/正文渲染。
- * 4. 解决策略：
- *    - 策略 A：拦截并清空 getItem / f(pos) 返回的 k4 实体的字段
- *    - 策略 B：拦截 adapter.getView，在视图返回后直接将 ViewHolder 或 View 树中的最后一条消息和红点彻底隐藏/清空
- *    - 策略 C：拦截数据源模型 fh5.x 中的文本字段
+ * 8.0.76 架构与精准过滤：
+ * 1. 适配器类：fh5.w0
+ * 2. 避免误伤：严禁在未获取到明确用户名时做兜底隐藏！
+ *    通过 param.args[0] (position) -> adapter.f(pos) / getItem(pos) 精准获取对应的 k4 / Conversation
+ *    从中取出 field_username，必须精确命中 WXMaskPlugin.containChatUser(chatUser) 才执行隐藏。
+ * 3. 彻底抹除：
+ *    对命中配置的用户，清除 NoMeasuredTextView (fh5.n.f) 的文本和 View.INVISIBLE，
+ *    隐藏红点 (fh5.n.g) 和草稿提示 (fh5.n.e)。
  */
 class HideMainUIListPluginPart : IPlugin {
 
@@ -78,8 +76,6 @@ class HideMainUIListPluginPart : IPlugin {
         if (adapterClazzName != null) {
             val adapterClass = ClazzN.from(adapterClazzName, context.classLoader)
             getItemMethod = findGetItemMethod(adapterClass)
-            
-            // 8.0.76 强力双重 Hook：不仅 hook 数据模型，还直接 hook getView 渲染
             hookAdapterGetView(adapterClass)
         }
 
@@ -148,41 +144,42 @@ class HideMainUIListPluginPart : IPlugin {
             object : XC_MethodHook2() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val itemView = param.result as? View ?: return
-                    val tag = itemView.tag ?: return
+                    val pos = param.args[0] as? Int ?: return
 
-                    // 获取用户名
+                    // 精准获取当前 position 的用户名，绝不模糊推断
                     var chatUser: String? = null
+
+                    // 途径 1：调用 Adapter 的获取数据方法
                     try {
-                        // 优先从 tag 中的 ViewHolder 提取或 tag 关联对象提取
-                        val conv = XposedHelpers2.getObjectField<Any?>(tag, "d")
-                        if (conv != null) {
-                            chatUser = XposedHelpers2.getObjectField<String?>(conv, "field_username")
+                        val item = XposedHelpers2.callMethod<Any?>(param.thisObject, GetItemMethodName, pos)
+                            ?: XposedHelpers2.callMethod<Any?>(param.thisObject, "getItem", pos)
+                        if (item != null) {
+                            chatUser = try {
+                                XposedHelpers2.getObjectField<String?>(item, "field_username")
+                            } catch (e: Throwable) {
+                                null
+                            }
                         }
                     } catch (e: Throwable) {
                     }
 
+                    // 途径 2：从 ViewHolder (tag) 中提取底层实体 (d 字段)
                     if (chatUser.isNullOrEmpty()) {
-                        try {
-                            chatUser = XposedHelpers2.getObjectField<String?>(tag, "field_username")
-                        } catch (e: Throwable) {
-                        }
-                    }
-
-                    if (chatUser.isNullOrEmpty()) {
-                        // 通过 adapter 获取当前 position 的 item
-                        try {
-                            val pos = param.args[0] as Int
-                            val item = XposedHelpers2.callMethod<Any?>(param.thisObject, GetItemMethodName, pos)
-                                ?: XposedHelpers2.callMethod<Any?>(param.thisObject, "getItem", pos)
-                            if (item != null) {
-                                chatUser = XposedHelpers2.getObjectField<String?>(item, "field_username")
+                        val tag = itemView.tag
+                        if (tag != null) {
+                            try {
+                                val conv = XposedHelpers2.getObjectField<Any?>(tag, "d")
+                                if (conv != null) {
+                                    chatUser = XposedHelpers2.getObjectField<String?>(conv, "field_username")
+                                }
+                            } catch (e: Throwable) {
                             }
-                        } catch (e: Throwable) {
                         }
                     }
 
-                    if (chatUser != null && WXMaskPlugin.containChatUser(chatUser)) {
-                        maskItemViews(itemView, tag)
+                    // 只有在明确拿到 chatUser 且命中黑名单时才处理，避免误杀未配置的用户！
+                    if (!chatUser.isNullOrEmpty() && WXMaskPlugin.containChatUser(chatUser)) {
+                        maskItemViews(itemView, itemView.tag)
                     }
                 }
             }
@@ -191,35 +188,36 @@ class HideMainUIListPluginPart : IPlugin {
         LogUtil.i("Successfully hooked getView method: $methodSign")
     }
 
-    private fun maskItemViews(itemView: View, tag: Any) {
+    private fun maskItemViews(itemView: View, tag: Any?) {
         try {
-            // 1. 针对 ViewHolder (fh5.n) 进行直接抹除
-            // f 字段是最后一条消息 NoMeasuredTextView
-            try {
-                val lastMsgView = XposedHelpers2.getObjectField<Any?>(tag, "f")
-                if (lastMsgView != null) {
-                    XposedHelpers2.callMethod<Any?>(lastMsgView, "setText", "")
-                    (lastMsgView as? View)?.visibility = View.INVISIBLE
+            if (tag != null) {
+                // 抹除最后一条消息 NoMeasuredTextView (fh5.n.f)
+                try {
+                    val lastMsgView = XposedHelpers2.getObjectField<Any?>(tag, "f")
+                    if (lastMsgView != null) {
+                        XposedHelpers2.callMethod<Any?>(lastMsgView, "setText", "")
+                        (lastMsgView as? View)?.visibility = View.INVISIBLE
+                    }
+                } catch (e: Throwable) {
                 }
-            } catch (e: Throwable) {
+
+                // 抹除草稿/状态 TextView (fh5.n.e)
+                try {
+                    val statusTv = XposedHelpers2.getObjectField<TextView?>(tag, "e")
+                    statusTv?.text = ""
+                    statusTv?.visibility = View.INVISIBLE
+                } catch (e: Throwable) {
+                }
+
+                // 抹除红点 TextView (fh5.n.g)
+                try {
+                    val tipTv = XposedHelpers2.getObjectField<TextView?>(tag, "g")
+                    tipTv?.visibility = View.INVISIBLE
+                } catch (e: Throwable) {
+                }
             }
 
-            // e 字段是草稿/状态提示 TextView
-            try {
-                val statusTv = XposedHelpers2.getObjectField<TextView?>(tag, "e")
-                statusTv?.text = ""
-                statusTv?.visibility = View.INVISIBLE
-            } catch (e: Throwable) {
-            }
-
-            // g 字段是未读消息红点 TextView
-            try {
-                val tipTv = XposedHelpers2.getObjectField<TextView?>(tag, "g")
-                tipTv?.visibility = View.INVISIBLE
-            } catch (e: Throwable) {
-            }
-
-            // 2. 通用 View 递归查找抹除最后一条消息控件
+            // 补充资源 ID 级隐藏
             val tipTvId = ResUtil.getViewId("kmv")
             if (tipTvId != 0) {
                 itemView.findViewById<View>(tipTvId)?.visibility = View.INVISIBLE
