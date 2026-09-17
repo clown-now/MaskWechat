@@ -32,14 +32,12 @@ import com.lu.wxmask.util.ext.getViewId
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 
 /**
- * 聊天页页面处理（精准闭环版本）：
+ * 聊天页页面处理（8.0.76 混淆原语闭环版本）：
  * 
- * 微信8.0.76 单例架构下的核心生命周期拦截点：
- * 1. startChatting：点击会话进入聊天框的一瞬间被调用 -> 记录 currentChattingUser，重置临时解锁
- * 2. closeChatting：按返回键、侧滑退出、关闭聊天框的一瞬间被调用 -> 清空 currentChattingUser，清空解锁标记
- * 3. BaseChattingUIFragment 的 onEnterBegin / onActivityCreated / onResume：
- *    - 无论微信何时重绘，只要 currentChattingUser 属于私密好友，且未在当前被临时解锁 -> 立即遮挡
- *    - 只要不是私密好友，或者已被临时解锁 -> 绝对放行，绝不误遮
+ * 逆向还原微信底层真实方法名：
+ * 1. onEnterBegin 混淆名为 M0() -> 进聊天框必走 M0()！
+ * 2. onExitBegin  混淆名为 O0() -> 离开聊天框必走 O0()！
+ * 3. 任何时候通过 M0/O0 闭环管理私密用户遮罩与临时解锁，彻底解决主页进出不锁问题！
  */
 class EnterChattingUIPluginPart() : IPlugin {
 
@@ -48,95 +46,49 @@ class EnterChattingUIPluginPart() : IPlugin {
         @Volatile
         var currentChattingUser: String? = null
         val unlockedUsers = HashSet<String>()
-        var cachedFragment: Any? = null
     }
 
     override fun handleHook(context: Context, lpparam: XC_LoadPackage.LoadPackageParam) {
-        hookStartChatting(context, lpparam)
-        hookCloseChatting(context)
-        handleChattingUIFragment(context, lpparam)
-    }
-
-    /**
-     * 1. 监听打开聊天框入口（startChatting）
-     */
-    private fun hookStartChatting(context: Context, lpparam: XC_LoadPackage.LoadPackageParam) {
-        val launcherUIClazz = XposedHelpers2.findClassIfExists("com.tencent.mm.ui.LauncherUI", context.classLoader)
-        if (launcherUIClazz != null) {
-            val startChattingMethods = XposedHelpers2.findMethodsByExactPredicate(launcherUIClazz) { m ->
-                m.name == "startChatting" && m.parameterTypes.isNotEmpty() && m.parameterTypes[0] == String::class.java
-            }
-            startChattingMethods.forEach { method ->
-                XposedHelpers2.hookMethod(
-                    method,
-                    object : XC_MethodHook2() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            val targetUser = param.args[0] as? String
-                            if (!targetUser.isNullOrEmpty()) {
-                                if (currentChattingUser != targetUser) {
-                                    unlockedUsers.clear()
-                                }
-                                currentChattingUser = targetUser
-                                LogUtil.i("startChatting -> current target user: $targetUser")
-                                
-                                cachedFragment?.let { frag ->
-                                    EnterChattingHookAction(context, lpparam, TAG_MASK_VIEW).handle(frag)
-                                }
-                            }
-                        }
-                    }
-                )
-            }
-        }
-    }
-
-    /**
-     * 2. 监听退出聊天框入口（closeChatting）
-     * 无论按左上角返回、按系统返回键、还是侧滑返回，微信必走 closeChatting！
-     */
-    private fun hookCloseChatting(context: Context) {
-        val launcherUIClazz = XposedHelpers2.findClassIfExists("com.tencent.mm.ui.LauncherUI", context.classLoader)
-        if (launcherUIClazz != null) {
-            val closeChattingMethods = XposedHelpers2.findMethodsByExactPredicate(launcherUIClazz) { m ->
-                m.name == "closeChatting"
-            }
-            closeChattingMethods.forEach { method ->
-                XposedHelpers2.hookMethod(
-                    method,
-                    object : XC_MethodHook2() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            LogUtil.i("closeChatting called -> exit conversation, reset all unlock states")
-                            unlockedUsers.clear()
-                            currentChattingUser = null
-                        }
-                    }
-                )
-            }
-        }
-    }
-
-    private fun handleChattingUIFragment(context: Context, lpparam: XC_LoadPackage.LoadPackageParam) {
         val enterAction = EnterChattingHookAction(context, lpparam, TAG_MASK_VIEW)
+        val chattingUIFragmentClazz = ClazzN.from("com.tencent.mm.ui.chatting.ChattingUIFragment", context.classLoader)
+            ?: ClazzN.from(ClazzN.BaseChattingUIFragment, context.classLoader)
 
-        // 尝试 Hook 微信进入聊天框的核心回调 onEnterBegin（比 onResume 更加可靠，从主页拉出聊天框必走此方法！）
+        // 1. Hook onEnterBegin -> 混淆名 M0()
         runCatching {
-            val baseFragmentClass = ClazzN.from(ClazzN.BaseChattingUIFragment, context.classLoader)
-            val onEnterBeginMethod = XposedHelpers2.findMethodExactIfExists(baseFragmentClass, "onEnterBegin")
-            if (onEnterBeginMethod != null) {
-                XposedHelpers2.hookMethod(
-                    onEnterBeginMethod,
-                    object : XC_MethodHook2() {
-                        override fun afterHookedMethod(param: MethodHookParam) {
-                            cachedFragment = param.thisObject
-                            enterAction.handle(param.thisObject)
-                        }
+            XposedHelpers2.findAndHookMethod(
+                chattingUIFragmentClazz,
+                "M0",
+                object : XC_MethodHook2() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        LogUtil.i("ChattingUIFragment.M0 (onEnterBegin) triggered")
+                        enterAction.handle(param.thisObject)
                     }
-                )
-                LogUtil.i("Successfully hooked onEnterBegin in BaseChattingUIFragment")
-            }
+                }
+            )
+            LogUtil.i("Successfully hooked M0 (onEnterBegin)")
+        }.onFailure {
+            LogUtil.w("Hook M0 failed", it)
         }
 
-        // onActivityCreated
+        // 2. Hook onExitBegin -> 混淆名 O0()
+        runCatching {
+            XposedHelpers2.findAndHookMethod(
+                chattingUIFragmentClazz,
+                "O0",
+                object : XC_MethodHook2() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        LogUtil.i("ChattingUIFragment.O0 (onExitBegin) triggered -> reset lock!")
+                        unlockedUsers.clear()
+                        currentChattingUser = null
+                    }
+                }
+            )
+            LogUtil.i("Successfully hooked O0 (onExitBegin)")
+        }.onFailure {
+            LogUtil.w("Hook O0 failed", it)
+        }
+
+        // 3. 补充 onActivityCreated 作为初次冷启动保障
         runCatching {
             XposedHelpers2.findAndHookMethod(
                 ClazzN.BaseChattingUIFragment,
@@ -145,39 +97,9 @@ class EnterChattingUIPluginPart() : IPlugin {
                 Bundle::class.java,
                 object : XC_MethodHook2() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        cachedFragment = param.thisObject
                         enterAction.handle(param.thisObject)
                     }
                 })
-        }
-
-        // onResume
-        runCatching {
-            XposedHelpers2.findAndHookMethod(
-                ClazzN.BaseChattingUIFragment,
-                context.classLoader,
-                "onResume",
-                object : XC_MethodHook2() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        cachedFragment = param.thisObject
-                        enterAction.handle(param.thisObject)
-                    }
-                }
-            )
-        }
-
-        // onPause
-        runCatching {
-            XposedHelpers2.findAndHookMethod(
-                ClazzN.BaseChattingUIFragment,
-                context.classLoader,
-                "onPause",
-                object : XC_MethodHook2() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        unlockedUsers.clear()
-                    }
-                }
-            )
         }
     }
 }
@@ -190,7 +112,10 @@ class EnterChattingHookAction(
     fun handle(fragmentObj: Any) {
         val activity = ReflectUtil.invokeMethod(fragmentObj, "getActivity") as Activity? ?: return
 
-        var chatUser: String? = EnterChattingUIPluginPart.currentChattingUser
+        // 精准提取微信号：从 Fragment 的 getStringExtra("Chat_User") 或 arguments 提取
+        var chatUser: String? = runCatching {
+            XposedHelpers2.callMethod<String?>(fragmentObj, "getStringExtra", "Chat_User")
+        }.getOrNull()
 
         if (chatUser.isNullOrEmpty()) {
             try {
@@ -207,15 +132,19 @@ class EnterChattingHookAction(
             }
         }
 
-        LogUtil.i("enter chattingUI action handle, user: $chatUser")
+        LogUtil.i("enter chattingUI action handle, resolved user: $chatUser")
+        EnterChattingUIPluginPart.currentChattingUser = chatUser
 
         if (!chatUser.isNullOrEmpty() && WXMaskPlugin.containChatUser(chatUser)) {
             if (EnterChattingUIPluginPart.unlockedUsers.contains(chatUser)) {
+                // 本次已临时解锁 -> 正常显示
                 showChatListUI(fragmentObj)
             } else {
+                // 强制遮挡
                 hideChatListUI(fragmentObj, activity, chatUser)
             }
         } else {
+            // 普通好友 -> 正常显示
             showChatListUI(fragmentObj)
         }
 
