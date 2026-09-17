@@ -28,6 +28,7 @@ import com.lu.wxmask.plugin.WXMaskPlugin
 import com.lu.wxmask.util.AppVersionUtil
 import com.lu.wxmask.util.ConfigUtil
 import com.lu.wxmask.util.QuickCountClickListenerUtil
+import com.lu.wxmask.util.ext.getViewId
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 
 /**
@@ -184,7 +185,7 @@ class EnterChattingHookAction(
     }
 
     private fun handleUserInputMagic(activity: Activity, fragmentObj: Any, chatUser: String) {
-        val userInputView: EditText? = getUserChatEditText(fragmentObj) ?: return
+        val userInputView: EditText = getUserChatEditText(fragmentObj) ?: return
         if (!ConfigUtil.getOptionData().enableChattingKey) return
 
         userInputView.addTextChangedListener {
