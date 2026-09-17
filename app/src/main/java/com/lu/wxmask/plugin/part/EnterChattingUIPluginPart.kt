@@ -16,7 +16,6 @@ import com.lu.lposed.plugin.IPlugin
 import com.lu.lposed.plugin.PluginProviders
 import com.lu.magic.util.ReflectUtil
 import com.lu.magic.util.ResUtil
-import com.lu.magic.util.ToastUtil
 import com.lu.magic.util.kxt.toElseEmptyString
 import com.lu.magic.util.log.LogUtil
 import com.lu.magic.util.view.ChildDeepCheck
@@ -27,28 +26,68 @@ import com.lu.wxmask.bean.QuickTemporaryBean
 import com.lu.wxmask.plugin.WXConfigPlugin
 import com.lu.wxmask.plugin.WXMaskPlugin
 import com.lu.wxmask.util.AppVersionUtil
-import com.lu.wxmask.util.ClipboardUtil
 import com.lu.wxmask.util.ConfigUtil
 import com.lu.wxmask.util.QuickCountClickListenerUtil
-import com.lu.wxmask.util.ext.getViewId
-import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 
 /**
- * 聊天页页面处理：
- * 1、隐藏单聊/群聊聊天记录
- * 2、支持退出聊天后再次进入重新自动上锁
- * 3、精准提取 Chat_User，严禁误锁未配置的正常好友！
+ * 聊天页页面处理（精准隔离版本）：
+ * 
+ * 核心设计：
+ * 微信采用单例宿主复用机制：点进任何好友，都是同一个 MMChattingListView / ChattingUIFragment！
+ * 1. 绝不盲目 hide！进入任何好友时，首先检查是否私密好友。
+ *    - 若是私密好友，且未在当前被临时解锁 -> 盖上遮罩 / 设为 INVISIBLE
+ *    - 若不是私密好友，或者私密好友已解锁 -> 强制设为 VISIBLE
+ * 2. 借助 LauncherUI.startChatting(String, Bundle, boolean) 与 BaseConversationUI.startChatting
+ *    在每次用户点击进入聊天时，精准记录当前的 targetUser，并重置上一位好友的临时解锁标记！
  */
 class EnterChattingUIPluginPart() : IPlugin {
+
+    companion object {
+        const val TAG_MASK_VIEW = "chatting-onEnterBegin"
+        var currentChattingUser: String? = null
+        val unlockedUsers = HashSet<String>()
+    }
+
     override fun handleHook(context: Context, lpparam: XC_LoadPackage.LoadPackageParam) {
+        hookStartChatting(context)
         handleChattingUIFragment(context, lpparam)
     }
 
-    private fun handleChattingUIFragment(context: Context, lpparam: XC_LoadPackage.LoadPackageParam) {
-        val tagConst = "chatting-onEnterBegin"
-        val enterAction = EnterChattingHookAction(context, lpparam, tagConst)
+    /**
+     * 监听点击会话进入聊天框的最上层入口：精准获知当前点进的是谁！
+     */
+    private fun hookStartChatting(context: Context) {
+        val launcherUIClazz = XposedHelpers2.findClassIfExists("com.tencent.mm.ui.LauncherUI", context.classLoader)
+        if (launcherUIClazz != null) {
+            val startChattingMethods = XposedHelpers2.findMethodsByExactPredicate(launcherUIClazz) { m ->
+                m.name == "startChatting" && m.parameterTypes.isNotEmpty() && m.parameterTypes[0] == String::class.java
+            }
+            startChattingMethods.forEach { method ->
+                XposedHelpers2.hookMethod(
+                    method,
+                    object : XC_MethodHook2() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val targetUser = param.args[0] as? String
+                            if (!targetUser.isNullOrEmpty()) {
+                                if (currentChattingUser != targetUser) {
+                                    // 切换了会话：清除所有临时解锁
+                                    unlockedUsers.clear()
+                                }
+                                currentChattingUser = targetUser
+                                LogUtil.i("startChatting target user: $targetUser")
+                            }
+                        }
+                    }
+                )
+            }
+        }
+    }
 
+    private fun handleChattingUIFragment(context: Context, lpparam: XC_LoadPackage.LoadPackageParam) {
+        val enterAction = EnterChattingHookAction(context, lpparam, TAG_MASK_VIEW)
+
+        // onActivityCreated
         runCatching {
             XposedHelpers2.findAndHookMethod(
                 ClazzN.BaseChattingUIFragment,
@@ -57,16 +96,12 @@ class EnterChattingUIPluginPart() : IPlugin {
                 Bundle::class.java,
                 object : XC_MethodHook2() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        super.afterHookedMethod(param)
-                        enterAction.handle(param)
+                        enterAction.handle(param.thisObject)
                     }
                 })
-        }.onFailure {
-            LogUtil.e("hook onActivityCreated error", it)
-            return
         }
 
-        // 每次恢复可见或切换进入时触发
+        // onResume
         runCatching {
             XposedHelpers2.findAndHookMethod(
                 ClazzN.BaseChattingUIFragment,
@@ -74,16 +109,13 @@ class EnterChattingUIPluginPart() : IPlugin {
                 "onResume",
                 object : XC_MethodHook2() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        super.afterHookedMethod(param)
-                        enterAction.handle(param)
+                        enterAction.handle(param.thisObject)
                     }
                 }
             )
-        }.onFailure {
-            LogUtil.e("hook onResume error", it)
         }
 
-        // 离开聊天界面时清理解锁状态
+        // onPause：离开当前聊天框时，清理临时解锁状态，确保下次返回必须重新解锁
         runCatching {
             XposedHelpers2.findAndHookMethod(
                 ClazzN.BaseChattingUIFragment,
@@ -91,13 +123,10 @@ class EnterChattingUIPluginPart() : IPlugin {
                 "onPause",
                 object : XC_MethodHook2() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        super.afterHookedMethod(param)
-                        enterAction.onExitChatting(param.thisObject)
+                        unlockedUsers.clear()
                     }
                 }
             )
-        }.onFailure {
-            LogUtil.e("hook onPause error", it)
         }
     }
 }
@@ -107,33 +136,20 @@ class EnterChattingHookAction(
     val lpparam: XC_LoadPackage.LoadPackageParam,
     val tagConst: String
 ) {
-    // 记录用户当前会话临时解锁的用户名，离开会话时清理
-    private val unlockedUsers = HashSet<String>()
-
-    fun onExitChatting(fragmentObj: Any) {
-        try {
-            unlockedUsers.clear()
-        } catch (e: Throwable) {
-        }
-    }
-
-    fun handle(param: XC_MethodHook.MethodHookParam) {
-        val fragmentObj = param.thisObject
+    fun handle(fragmentObj: Any) {
         val activity = ReflectUtil.invokeMethod(fragmentObj, "getActivity") as Activity? ?: return
 
-        // 多途径精准提取真实对话对象的微信号
-        var chatUser: String? = null
+        // 精准获取微信号：优先采用 startChatting 捕获的 currentChattingUser
+        var chatUser: String? = EnterChattingUIPluginPart.currentChattingUser
 
-        // 途径 1：从 Fragment 的 getArguments() 中获取
-        try {
-            val arguments = ReflectUtil.invokeMethod(fragmentObj, "getArguments") as Bundle?
-            if (arguments != null) {
-                chatUser = arguments.getString("Chat_User")
+        if (chatUser.isNullOrEmpty()) {
+            try {
+                val arguments = ReflectUtil.invokeMethod(fragmentObj, "getArguments") as Bundle?
+                chatUser = arguments?.getString("Chat_User")
+            } catch (e: Throwable) {
             }
-        } catch (e: Throwable) {
         }
 
-        // 途径 2：从 Activity 的 Intent 中获取
         if (chatUser.isNullOrEmpty()) {
             try {
                 chatUser = activity.intent?.getStringExtra("Chat_User")
@@ -141,26 +157,19 @@ class EnterChattingHookAction(
             }
         }
 
-        // 途径 3：调用 Fragment 的 getTalkerUserName() 方法
-        if (chatUser.isNullOrEmpty()) {
-            try {
-                chatUser = XposedHelpers2.callMethod<String?>(fragmentObj, "getTalkerUserName")
-            } catch (e: Throwable) {
-            }
-        }
+        LogUtil.i("enter chattingUI, current chatUser: $chatUser")
 
-        LogUtil.i("enter chattingUI, resolved chatUser: $chatUser")
-
-        // 极其重要：只有拿到明确用户名且该用户名被添加到了配置列表，才执行遮挡！
-        // 如果不是私密好友，绝对执行 showChatListUI，绝不误挡正常好友！
+        // 核心分支：只有命中了私密名单才遮挡！
         if (!chatUser.isNullOrEmpty() && WXMaskPlugin.containChatUser(chatUser)) {
-            // 如果已经被用户本次临时解锁过，则不重复遮挡
-            if (unlockedUsers.contains(chatUser)) {
+            if (EnterChattingUIPluginPart.unlockedUsers.contains(chatUser)) {
+                // 已被本次临时解锁：放行
                 showChatListUI(fragmentObj)
             } else {
+                // 遮挡上锁
                 hideChatListUI(fragmentObj, activity, chatUser)
             }
         } else {
+            // 普通正常好友：必须无条件放行显示，绝不遮挡！
             showChatListUI(fragmentObj)
         }
 
@@ -175,13 +184,8 @@ class EnterChattingHookAction(
     }
 
     private fun handleUserInputMagic(activity: Activity, fragmentObj: Any, chatUser: String) {
-        val userInputView: EditText? = getUserChatEditText(fragmentObj)
-        if (userInputView == null) {
-            return
-        }
-        if (!ConfigUtil.getOptionData().enableChattingKey) {
-            return
-        }
+        val userInputView: EditText? = getUserChatEditText(fragmentObj) ?: return
+        if (!ConfigUtil.getOptionData().enableChattingKey) return
 
         userInputView.addTextChangedListener {
             val editable = it ?: return@addTextChangedListener
@@ -191,17 +195,13 @@ class EnterChattingHookAction(
                     PluginProviders.from(WXConfigPlugin::class.java).showAddMaskDialog(userInputView.context, fragmentObj)
                     editable.clear()
                 }
-
                 "#del" -> {
                     AlertDialog.Builder(activity)
                         .setTitle("提示")
-                        .setMessage("是否移除wxid:" + chatUser)
+                        .setMessage("是否移除wxid:$chatUser")
                         .setNegativeButton("确定") { _, _ ->
                             ConfigUtil.removeMaskItem(chatUser)
-                            val chatListView: View? = findChatListView(fragmentObj)
-                            if (chatListView != null) {
-                                chatListView.visibility = View.VISIBLE
-                            }
+                            showChatListUI(fragmentObj)
                         }
                         .setNeutralButton("取消") { _, _ ->
                             editable.clear()
@@ -209,7 +209,6 @@ class EnterChattingHookAction(
                         .show()
                     editable.clear()
                 }
-
                 "#clear" -> {
                     AlertDialog.Builder(activity)
                         .setTitle("提示")
@@ -231,9 +230,7 @@ class EnterChattingHookAction(
         return XposedHelpers2.callMethod<View?>(fragmentObj, "findViewById", ResUtil.getViewId("bkk"))?.let {
             ChildDeepCheck().filter(it) { child ->
                 child is EditText
-            }?.firstOrNull()?.let {
-                it as EditText
-            }
+            }?.firstOrNull() as? EditText
         }
     }
 
@@ -260,14 +257,10 @@ class EnterChattingHookAction(
                     "com.tencent.mm.ui.chatting.view.MMChattingListView",
                     context.classLoader
                 )
-                if (MMListViewClazz == null) {
-                    null
-                } else {
-                    val mmListViewField =
-                        XposedHelpers2.findFirstFieldByExactType(fragmentObj.javaClass, MMListViewClazz)
-                    val mmListView = mmListViewField.get(fragmentObj)
-                    mmListView as View
-                }
+                if (MMListViewClazz != null) {
+                    val mmListViewField = XposedHelpers2.findFirstFieldByExactType(fragmentObj.javaClass, MMListViewClazz)
+                    mmListViewField.get(fragmentObj) as View
+                } else null
             }.getOrNull()
         }
         return listView
@@ -292,11 +285,8 @@ class EnterChattingHookAction(
 
     private fun hideChatListUI(fragmentObj: Any, activity: Activity, chatUser: String) {
         val maskItem = try {
-            ConfigUtil.getMaskList().first {
-                it.maskId == chatUser
-            }
+            ConfigUtil.getMaskList().first { it.maskId == chatUser }
         } catch (e: Exception) {
-            LogUtil.w(e)
             return
         }
 
@@ -306,19 +296,16 @@ class EnterChattingHookAction(
 
             val quick = QuickTemporaryBean(ConfigUtil.getTemporaryJson() ?: JsonObject())
             QuickCountClickListenerUtil.register(chatListView.parent as? View?, quick.clickCount, quick.duration) {
-                // 点击完成解锁：恢复可见，并记录到已解锁列表
+                // 点击完成临时解锁
                 chatListView.visibility = View.VISIBLE
-                unlockedUsers.add(chatUser)
+                EnterChattingUIPluginPart.unlockedUsers.add(chatUser)
             }
             LogUtil.i("hide chatListView by setVisible for $chatUser")
         } else {
             hideListViewUIByMask(fragmentObj)
-            LogUtil.i("hide chatListView by add Mask for $chatUser")
         }
 
-        if (Constrant.WX_MASK_TIP_MODE_SILENT == maskItem.tipMode) {
-            // 静默模式
-        } else if (Constrant.CONFIG_TIP_MODE_ALERT == maskItem.tipMode) {
+        if (Constrant.CONFIG_TIP_MODE_ALERT == maskItem.tipMode) {
             handleAlertMode(activity, maskItem)
         }
     }
