@@ -9,8 +9,6 @@ import android.widget.TextView
 import com.lu.lposed.api2.XC_MethodHook2
 import com.lu.lposed.api2.XposedHelpers2
 import com.lu.lposed.plugin.IPlugin
-import com.lu.magic.util.ResUtil
-import com.lu.wxmask.util.ext.getViewId
 import com.lu.magic.util.log.LogUtil
 import com.lu.wxmask.ClazzN
 import com.lu.wxmask.Constrant
@@ -25,19 +23,13 @@ import java.lang.reflect.Modifier
 /**
  * 主页UI（微信Tab消息列表）处理插件
  * 
- * 8.0.76 精准适配架构：
- * 1. 适配器类：fh5.w0
- * 2. 数据获取：
- *    - 微信 8.0.76 中，适配器获取条目的精确方法为 f(int)，返回 com.tencent.mm.storage.k4
- *    - 在 getView(position, convertView, parent) 完成后，微信会将当前 item 实体通过 View.setTag(0x7f09165a, k4) 存入 itemView
- *    - 同时 ViewHolder (fh5.n) 保存在 itemView.getTag()
- * 3. 为什么之前仍会显示最后一条消息？
- *    因为微信 8.0.76 的 ItemView 会复用（RecycleView/ListView机制），如果某个未配置私密的用户复用了之前被 maskItemViews 隐藏了控件的 View，
- *    它的最后一条消息控件就会残留 INVISIBLE 状态（表现为未配置的用户也被隐藏了！）；
- *    而当配置用户复用了正常用户的 View 时，又必须彻底置空其内容并隐藏。
- *    因此，在 getView 之后：
- *    - 若属于私密配置用户 -> 强制 maskItemViews (隐藏最后一条消息、未读数、草稿)
- *    - 若属于正常用户 -> 强制 unmaskItemViews (恢复 View.VISIBLE，避免被复用带偏导致误杀！)
+ * 8.0.76 极简纯净方案：
+ * 绝不对主页 View 树做任何 setVisibility 篡改！
+ * 避免破坏 NoMeasuredTextView 与 unread tip TextView 的布局尺寸与 View 复用机制。
+ * 纯粹在数据源层（fh5.w0.f(int) / getItem(int)）将私密好友的 content、digest 清空为 ""，
+ * 将 unReadCount、UnReadInvite 等未读数置为 0，并将 msgType 标注为普通文本 "1"。
+ * 
+ * 只有当用户显式开启“主页变脸（enableMapConversation）”时，才进行 username 映射。
  */
 class HideMainUIListPluginPart : IPlugin {
 
@@ -81,7 +73,6 @@ class HideMainUIListPluginPart : IPlugin {
         if (adapterClazzName != null) {
             val adapterClass = ClazzN.from(adapterClazzName, context.classLoader)
             getItemMethod = findGetItemMethod(adapterClass)
-            hookAdapterGetView(adapterClass)
         }
 
         if (getItemMethod != null) {
@@ -110,7 +101,6 @@ class HideMainUIListPluginPart : IPlugin {
                     if (isHooked) return
 
                     if (adapterClassName.startsWith("com.tencent.mm.ui.conversation") || adapterClassName == "fh5.w0") {
-                        hookAdapterGetView(adapter.javaClass)
                         var m = findGetItemMethod(adapter.javaClass)
                         if (m == null && adapter.javaClass.superclass != null) {
                             m = findGetItemMethod(adapter.javaClass.superclass)
@@ -127,160 +117,6 @@ class HideMainUIListPluginPart : IPlugin {
                 }
             }
         )
-    }
-
-    private fun hookAdapterGetView(adapterClazz: Class<*>?) {
-        if (adapterClazz == null) return
-        val getViewMethod = XposedHelpers2.findMethodExactIfExists(
-            adapterClazz,
-            "getView",
-            Integer.TYPE,
-            View::class.java,
-            ViewGroup::class.java
-        ) ?: return
-
-        val methodSign = getViewMethod.toString()
-        if (MainHook.uniqueMetaStore.contains(methodSign)) {
-            return
-        }
-
-        XposedHelpers2.hookMethod(
-            getViewMethod,
-            object : XC_MethodHook2() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val itemView = param.result as? View ?: return
-                    val pos = param.args[0] as? Int ?: return
-
-                    var chatUser: String? = null
-
-                    // 途径 1：从微信 8.0.76 给 View 存入的精准 Tag (0x7f09165a) 中直接提取 k4 对象
-                    try {
-                        val k4Tag = itemView.getTag(0x7f09165a)
-                        if (k4Tag != null) {
-                            chatUser = XposedHelpers2.getObjectField<String?>(k4Tag, "field_username")
-                        }
-                    } catch (e: Throwable) {
-                    }
-
-                    // 途径 2：通过调用 Adapter 的获取条目方法
-                    if (chatUser.isNullOrEmpty()) {
-                        try {
-                            val item = XposedHelpers2.callMethod<Any?>(param.thisObject, GetItemMethodName, pos)
-                                ?: XposedHelpers2.callMethod<Any?>(param.thisObject, "getItem", pos)
-                            if (item != null) {
-                                chatUser = try {
-                                    XposedHelpers2.getObjectField<String?>(item, "field_username")
-                                } catch (e: Throwable) {
-                                    null
-                                }
-                            }
-                        } catch (e: Throwable) {
-                        }
-                    }
-
-                    // 途径 3：从 ViewHolder (tag) 中提取 (d 字段)
-                    if (chatUser.isNullOrEmpty()) {
-                        val tag = itemView.tag
-                        if (tag != null) {
-                            try {
-                                val conv = XposedHelpers2.getObjectField<Any?>(tag, "d")
-                                if (conv != null) {
-                                    chatUser = XposedHelpers2.getObjectField<String?>(conv, "field_username")
-                                }
-                            } catch (e: Throwable) {
-                            }
-                        }
-                    }
-
-                    val isMaskTarget = !chatUser.isNullOrEmpty() && WXMaskPlugin.containChatUser(chatUser)
-                    if (isMaskTarget) {
-                        maskItemViews(itemView, itemView.tag)
-                    } else {
-                        // 极其重要：处理 View 复用！非私密好友必须确保显示，恢复可见性，防止被之前的复用污染误隐藏！
-                        unmaskItemViews(itemView, itemView.tag)
-                    }
-                }
-            }
-        )
-        MainHook.uniqueMetaStore.add(methodSign)
-        LogUtil.i("Successfully hooked getView method: $methodSign")
-    }
-
-    private fun maskItemViews(itemView: View, tag: Any?) {
-        try {
-            if (tag != null) {
-                // 1. 抹除最后一条消息 NoMeasuredTextView (fh5.n.f)
-                try {
-                    val lastMsgView = XposedHelpers2.getObjectField<Any?>(tag, "f")
-                    if (lastMsgView != null) {
-                        XposedHelpers2.callMethod<Any?>(lastMsgView, "setText", "")
-                        (lastMsgView as? View)?.visibility = View.INVISIBLE
-                    }
-                } catch (e: Throwable) {
-                }
-
-                // 2. 抹除草稿/状态 TextView (fh5.n.e)
-                try {
-                    val statusTv = XposedHelpers2.getObjectField<TextView?>(tag, "e")
-                    statusTv?.text = ""
-                    statusTv?.visibility = View.INVISIBLE
-                } catch (e: Throwable) {
-                }
-
-                // 3. 抹除未读红点 TextView (fh5.n.g)
-                try {
-                    val tipTv = XposedHelpers2.getObjectField<TextView?>(tag, "g")
-                    tipTv?.visibility = View.INVISIBLE
-                } catch (e: Throwable) {
-                }
-            }
-
-            // 补充资源 ID 级隐藏
-            val tipTvId = ResUtil.getViewId("kmv")
-            if (tipTvId != 0) {
-                itemView.findViewById<View>(tipTvId)?.visibility = View.INVISIBLE
-            }
-            val lastMsgId = ResUtil.getViewId("ht5")
-            if (lastMsgId != 0) {
-                itemView.findViewById<View>(lastMsgId)?.visibility = View.INVISIBLE
-            }
-        } catch (e: Throwable) {
-            LogUtil.w("maskItemViews error: ", e)
-        }
-    }
-
-    private fun unmaskItemViews(itemView: View, tag: Any?) {
-        try {
-            if (tag != null) {
-                try {
-                    val lastMsgView = XposedHelpers2.getObjectField<Any?>(tag, "f")
-                    (lastMsgView as? View)?.visibility = View.VISIBLE
-                } catch (e: Throwable) {
-                }
-
-                try {
-                    val statusTv = XposedHelpers2.getObjectField<TextView?>(tag, "e")
-                    statusTv?.visibility = View.VISIBLE
-                } catch (e: Throwable) {
-                }
-
-                try {
-                    val tipTv = XposedHelpers2.getObjectField<TextView?>(tag, "g")
-                    tipTv?.visibility = View.VISIBLE
-                } catch (e: Throwable) {
-                }
-            }
-
-            val tipTvId = ResUtil.getViewId("kmv")
-            if (tipTvId != 0) {
-                itemView.findViewById<View>(tipTvId)?.visibility = View.VISIBLE
-            }
-            val lastMsgId = ResUtil.getViewId("ht5")
-            if (lastMsgId != 0) {
-                itemView.findViewById<View>(lastMsgId)?.visibility = View.VISIBLE
-            }
-        } catch (e: Throwable) {
-        }
     }
 
     private fun findGetItemMethod(adapterClazz: Class<*>?): Method? {

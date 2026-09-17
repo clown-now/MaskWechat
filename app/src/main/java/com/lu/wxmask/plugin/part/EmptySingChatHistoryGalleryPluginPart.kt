@@ -20,9 +20,14 @@ import java.lang.reflect.Method
 
 /**
  * 置空单聊页面菜单的“查找聊天记录”搜索结果
+ * 
+ * 8.0.76 强力方案：
+ * 只要检测到查看的是私密用户的“查找聊天记录”（无论是图片及视频、表情、文件还是链接）：
+ * 在 Activity 启动时如果命中私密好友，直接关闭或清空数据源，彻底不给暴露任何记录的机会！
  */
 class EmptySingChatHistoryGalleryPluginPart : IPlugin {
     val MediaHistoryGalleryUI = "com.tencent.mm.ui.chatting.gallery.MediaHistoryGalleryUI"
+    val MediaHistoryListUI = "com.tencent.mm.ui.chatting.gallery.MediaHistoryListUI"
     var mChattingArguments: Bundle? = null
 
     override fun handleHook(context: Context, lpparam: XC_LoadPackage.LoadPackageParam?) {
@@ -32,7 +37,7 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
     }
 
     /**
-     * 处理8.0.49之后出现的图片搜索页面，发现交谈者是要隐藏的用户，直接结束图片搜索页面。因为该页面是compose写的，没有可以下手的地方
+     * 处理8.0.49之后出现的图片搜索页面，发现交谈者是要隐藏的用户，直接结束图片搜索页面。
      */
     private fun handleImageQueryMainUI(context: Context, lpparam: XC_LoadPackage.LoadPackageParam?) {
         val ImageQueryMainUI = ClazzN.from("com.tencent.mm.view.activity.ImageQueryMainUI") ?: return
@@ -67,22 +72,58 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                     val bundle: Bundle = mChattingArguments as Bundle
                     val thizUser = bundle.getString("Chat_User")
                     if (WXMaskPlugin.containChatUser(thizUser)) {
-                        //隐藏。
                         act.finish()
                     }
-                    val kSet = bundle.keySet()
-                    val sb = StringBuilder()
-
-                    for (key in kSet) {
-                        sb.append(key + ": " + bundle.get(key) + ", ")
-                    }
-                    LogUtil.d("ImageQueryMainUI onCreate", sb.toString())
                 }
             })
-
     }
 
     private fun setEmptyDetailHistoryUI(context: Context, lpparam: XC_LoadPackage.LoadPackageParam?) {
+        // 1. Hook MediaHistoryGalleryUI（图片及视频历史入口）
+        // 兜底直接在 onCreate 时拦截！如果私密好友进入，直接 finish，绝对不给图片视频显示的机会！
+        XposedHelpers2.findAndHookMethod(
+            MediaHistoryGalleryUI,
+            context.classLoader,
+            "onCreate",
+            Bundle::class.java,
+            object : XC_MethodHook2() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (!ConfigUtil.getOptionData().hideSingleSearch) {
+                        return
+                    }
+                    val activity = param.thisObject as? Activity ?: return
+                    val userName = activity.intent?.getStringExtra("kintent_talker")
+                    if (!userName.isNullOrBlank() && WXMaskPlugin.containChatUser(userName)) {
+                        LogUtil.i("MediaHistoryGalleryUI finish for masked user: $userName")
+                        activity.finish()
+                    }
+                }
+            }
+        )
+
+        // 2. Hook MediaHistoryListUI（表情、文件、链接入口）
+        // 同样在 onCreate 时进行检查
+        XposedHelpers2.findAndHookMethod(
+            MediaHistoryListUI,
+            context.classLoader,
+            "onCreate",
+            Bundle::class.java,
+            object : XC_MethodHook2() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (!ConfigUtil.getOptionData().hideSingleSearch) {
+                        return
+                    }
+                    val activity = param.thisObject as? Activity ?: return
+                    val userName = activity.intent?.getStringExtra("kintent_talker")
+                    if (!userName.isNullOrBlank() && WXMaskPlugin.containChatUser(userName)) {
+                        LogUtil.i("MediaHistoryListUI finish for masked user: $userName")
+                        activity.finish()
+                    }
+                }
+            }
+        )
+
+        // 数据置空逻辑
         setEmptyDetailHistoryUIForMedia(context, lpparam)
         setEmptyDetailHistoryUIForGalleryCompat(context, lpparam)
     }
@@ -97,10 +138,9 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
             Constrant.WX_CODE_8_0_49, Constrant.WX_CODE_8_0_51, Constrant.WX_CODE_8_0_56 , Constrant.WX_CODE_8_0_58 -> "y"
             Constrant.WX_CODE_8_0_50 -> "K"
             Constrant.WX_CODE_8_0_53 -> "z"
-            Constrant.WX_CODE_8_0_76 -> "A" // 8.0.76 MediaHistoryListUI.A(boolean, int)
+            Constrant.WX_CODE_8_0_76 -> "A"
             else -> "A"
         }
-        val MediaHistoryListUI = "com.tencent.mm.ui.chatting.gallery.MediaHistoryListUI"
         var mediaMethod: Method? = XposedHelpers2.findMethodExactIfExists(
             MediaHistoryListUI,
             context.classLoader,
@@ -119,7 +159,6 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
             if (guessMethods.size >= 1) {
                 mediaMethod = guessMethods[0]
             }
-            LogUtil.w(AppVersionUtil.getSmartVersionName(), "guess MediaHistoryListUI empty method is ", mediaMethod)
         }
         if (mediaMethod == null) {
             return
@@ -133,7 +172,6 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                 val intent = activity.intent
                 val userName = intent.getStringExtra("kintent_talker")
                 if (userName.isNullOrBlank()) {
-                    LogUtil.w("MediaHistoryListUI‘s user is empty", userName)
                     return
                 }
                 if (WXMaskPlugin.containChatUser(userName)) {
@@ -144,10 +182,6 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
         })
     }
 
-
-    /**
-     * 置空图片/视频搜索结果
-     */
     private fun setEmptyDetailHistoryUIForGalleryCompat(context: Context, lpparam: XC_LoadPackage.LoadPackageParam?) {
         if (AppVersionUtil.getVersionCode() > Constrant.WX_CODE_8_0_43) {
             setEmptyDetailHistoryUIForGallery8044(context, lpparam)
@@ -183,7 +217,6 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
             if (guessMethods.isNotEmpty()) {
                 galleryMethod = guessMethods[0]
             }
-            LogUtil.w(AppVersionUtil.getSmartVersionName(), "guess MediaHistoryGalleryUI empty method is ", galleryMethod)
         }
         XposedHelpers2.hookMethod(
             galleryMethod,
@@ -196,7 +229,6 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                     val intent = activity.intent
                     val userName = intent.getStringExtra("kintent_talker")
                     if (userName.isNullOrBlank()) {
-                        LogUtil.w("MediaHistoryListUI‘s user is empty", userName)
                         return
                     }
                     if (WXMaskPlugin.containChatUser(userName)) {
@@ -210,7 +242,7 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
     private fun setEmptyDetailHistoryUIForGallery8044(context: Context, lpparam: XC_LoadPackage.LoadPackageParam?) {
         val presenterClazz = when (AppVersionUtil.getVersionCode()) {
             in Constrant.WX_CODE_8_0_44..Constrant.WX_CODE_8_0_53 -> "com.tencent.mm.ui.chatting.presenter.k1"
-            Constrant.WX_CODE_8_0_76 -> "com.tencent.mm.ui.chatting.presenter.n3" // 8.0.76
+            Constrant.WX_CODE_8_0_76 -> "com.tencent.mm.ui.chatting.presenter.n3"
             else -> "com.tencent.mm.ui.chatting.presenter.n3"
         }
         var methods = XposedHelpers2.findMethodsByExactParameters(
@@ -231,7 +263,6 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
 
                         var fields = XposedHelpers2.findFieldsByExactPredicate(param.thisObject::class.java) {
                             var v = it.get(param.thisObject)
-
                             if (v != null && v.javaClass.name.equals(MediaHistoryGalleryUI)) {
                                 return@findFieldsByExactPredicate true
                             }
@@ -242,7 +273,6 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                             activity = fields[0].get(param.thisObject) as? Activity
                         }
                         if (activity == null) {
-                            // 尝试从 presenter 的成员变量获取 Context
                             try {
                                 val ctx = XposedHelpers2.getObjectField<Context?>(param.thisObject, "f")
                                 if (ctx is Activity) activity = ctx
@@ -250,13 +280,11 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                             }
                         }
                         if (activity == null) {
-                            LogUtil.w("can not find DetailHistoryUIForGallery8044")
                             return
                         }
                         val intent = activity.intent
                         val userName = intent.getStringExtra("kintent_talker")
                         if (userName.isNullOrBlank()) {
-                            LogUtil.w("presenter‘s user is empty", userName)
                             return
                         }
                         if (WXMaskPlugin.containChatUser(userName)) {
@@ -277,19 +305,17 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
             else -> "s"
         }
 
-        //tab==全部，搜索结果置空
+        // tab==全部
         XposedHelpers2.findAndHookMethod(
             "com.tencent.mm.ui.chatting.search.multi.fragment.FTSMultiAllResultFragment",
             context.classLoader,
             commonHookMethodName,
             java.util.ArrayList::class.java,
             object : XC_MethodHook2() {
-
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     if (!ConfigUtil.getOptionData().hideSingleSearch) {
                         return
                     }
-                    debugLog(param)
                     if (isHitMaskId(param.thisObject)) {
                         val arrayList: java.util.ArrayList<*> = param.args[0] as java.util.ArrayList<*>
                         arrayList.clear()
@@ -297,23 +323,18 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                 }
             }
         )
-        if (commonHookMethodName == null) {
-            LogUtil.i("setEmptyActionBarTabPageUI is null")
-            return
-        }
-        //其他的/普通的/一般的tab，搜索结果置空
+
+        // tab==普通
         XposedHelpers2.findAndHookMethod(
             "com.tencent.mm.ui.chatting.search.multi.fragment.FTSMultiNormalResultFragment",
             context.classLoader,
             commonHookMethodName,
             java.util.ArrayList::class.java,
             object : XC_MethodHook2() {
-
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     if (!ConfigUtil.getOptionData().hideSingleSearch) {
                         return
                     }
-                    debugLog(param)
                     if (isHitMaskId(param.thisObject)) {
                         val arrayList: java.util.ArrayList<*> = param.args[0] as java.util.ArrayList<*>
                         arrayList.clear()
@@ -322,7 +343,7 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
             }
         )
 
-        // tab==图片，全体视图替换置空
+        // tab==图片
         XposedHelpers2.findAndHookMethod(
             "com.tencent.mm.ui.chatting.search.multi.fragment.FTSMultiImageResultFragment",
             context.classLoader,
@@ -331,12 +352,10 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
             ViewGroup::class.java,
             Bundle::class.java,
             object : XC_MethodHook2() {
-
                 override fun afterHookedMethod(param: MethodHookParam) {
                     if (!ConfigUtil.getOptionData().hideSingleSearch) {
                         return
                     }
-                    debugLog(param)
                     if (isHitMaskId(param.thisObject)) {
                         val inflater = param.args[0] as LayoutInflater
                         val viewGroup: ViewGroup = param.args[1] as ViewGroup
@@ -348,25 +367,12 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
         )
     }
 
-    private fun debugLog(param: XC_MethodHook.MethodHookParam) {
-        LogUtil.d(
-            "set empty for ${param.thisObject}",
-            "hook method args:",
-            param.args,
-            "fragment arguments:",
-            XposedHelpers2.callMethod(param.thisObject, "getArguments"),
-        )
-    }
-
     private fun isHitMaskId(fragmentObj: Any?): Boolean {
         val activity = XposedHelpers2.callMethod<Activity>(fragmentObj, "getActivity") as Activity?
         if (activity == null) {
-            LogUtil.w("Not attach Activity for ", fragmentObj)
             return false
         }
         val intent = activity.intent
-        LogUtil.d(activity, activity.intent.extras)
-
         val username = intent.getStringExtra("detail_username")
         return WXMaskPlugin.containChatUser(username)
     }
