@@ -52,7 +52,7 @@ class EnterChattingUIPluginPart() : IPlugin {
     }
 
     override fun handleHook(context: Context, lpparam: XC_LoadPackage.LoadPackageParam) {
-        hookStartChatting(context)
+        hookStartChatting(context, lpparam)
         hookCloseChatting(context)
         handleChattingUIFragment(context, lpparam)
     }
@@ -60,7 +60,7 @@ class EnterChattingUIPluginPart() : IPlugin {
     /**
      * 1. 监听打开聊天框入口（startChatting）
      */
-    private fun hookStartChatting(context: Context) {
+    private fun hookStartChatting(context: Context, lpparam: XC_LoadPackage.LoadPackageParam) {
         val launcherUIClazz = XposedHelpers2.findClassIfExists("com.tencent.mm.ui.LauncherUI", context.classLoader)
         if (launcherUIClazz != null) {
             val startChattingMethods = XposedHelpers2.findMethodsByExactPredicate(launcherUIClazz) { m ->
