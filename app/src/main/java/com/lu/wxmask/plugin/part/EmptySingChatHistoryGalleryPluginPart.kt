@@ -19,27 +19,30 @@ import com.lu.wxmask.util.ConfigUtil
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 
 /**
- * 单聊页面“查找聊天记录”（日期、图片/视频、文件、链接、多标签搜索）智能处理：
+ * 单聊页面“查找聊天记录”（日期、图片/视频、文件、表情、多标签搜索）智能处理：
  * 
  * 规则：
  * 1. 只有未解锁状态下，进入查询页面才拦截显示“无结果”；
  * 2. 一旦用户在聊天界面点击完成了临时解锁（EnterChattingUIPluginPart.unlockedUsers 包含当前好友），
- *    则所有查询功能（按日期查找、图片/视频、文件、聊天记录搜索等）完全放行，正常展示真实数据！
+ *    则所有查询功能（按日期查找、图片/视频、文件、表情、聊天记录搜索等）完全放行，正常展示真实数据！
  * 3. 未解锁状态下：
- *    - 允许正常打开日期选择界面（SelectDateUI），但不加载任何历史消息日期点（日历全灰/不可点选，提示无记录）
- *    - 允许打开多媒体历史界面（MediaHistoryGalleryUI / MediaHistoryListUI），数据置空展示“无数据”
+ *    - 允许正常打开日期选择界面（SelectDateUI），日历主体隐藏，提示“无内容”
+ *    - 允许打开多媒体历史界面（MediaHistoryGalleryUI / MediaHistoryListUI），数据加载方法拦截置空，提示“无内容”
+ *    - 允许打开表情历史界面（EmojiHistoryListUI / EmojiHistoryListFragment），拦截 s0(List) 置空，提示“无内容”
  *    - 多标签搜索结果（FTSMultiAllResultFragment 等）清空列表，展示“无结果”
  */
 class EmptySingChatHistoryGalleryPluginPart : IPlugin {
     val MediaHistoryGalleryUI = "com.tencent.mm.ui.chatting.gallery.MediaHistoryGalleryUI"
     val MediaHistoryListUI = "com.tencent.mm.ui.chatting.gallery.MediaHistoryListUI"
     val EmojiHistoryListUI = "com.tencent.mm.ui.chatting.gallery.EmojiHistoryListUI"
+    val EmojiHistoryListFragment = "com.tencent.mm.ui.chatting.gallery.EmojiHistoryListFragment"
     val SelectDateUI = "com.tencent.mm.chatroom.ui.SelectDateUI"
 
     override fun handleHook(context: Context, lpparam: XC_LoadPackage.LoadPackageParam?) {
         handleImageQueryMainUI(context, lpparam)
         handleSelectDateUI(context, lpparam)
         handleMediaHistoryUI(context, lpparam)
+        handleEmojiHistoryUI(context, lpparam)
         setEmptyActionBarTabPageUI(context, lpparam)
     }
 
@@ -78,7 +81,6 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
 
     /**
      * 1. 拦截“按日期查找聊天记录”
-     * 未解锁状态下，在 onCreate 之后以及异步数据准备好时彻底清空记录，显示无聊天记录
      */
     private fun handleSelectDateUI(context: Context, lpparam: XC_LoadPackage.LoadPackageParam?) {
         try {
@@ -103,8 +105,6 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                 }
             )
 
-            // SelectDateUI 异步加载数据用的 Runnable 是 com.tencent.mm.chatroom.ui.lc
-            // 当 run() 结束时再次清空，防止被异步数据覆盖！
             val lcClazz = XposedHelpers2.findClassIfExists("com.tencent.mm.chatroom.ui.lc", context.classLoader)
             if (lcClazz != null) {
                 XposedHelpers2.findAndHookMethod(
@@ -135,25 +135,47 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
             val dateMap = XposedHelpers2.getObjectField(activity, "f") as? java.util.HashMap<*, *>
             dateMap?.clear()
 
-            // 隐藏日历主体
             val dayPickerView = XposedHelpers2.getObjectField(activity, "d") as? View
             dayPickerView?.visibility = View.GONE
 
-            // 显示无聊天记录 TextView
             val emptyTv = XposedHelpers2.getObjectField(activity, "m") as? TextView
             emptyTv?.visibility = View.VISIBLE
-            emptyTv?.text = "无聊天记录"
+            emptyTv?.text = "无内容"
         }
     }
 
     /**
-     * 2. 拦截图片/视频、文件等媒体历史（MediaHistoryGalleryUI / MediaHistoryListUI）
+     * 2. 拦截图片/视频历史（MediaHistoryGalleryUI）与文件历史（MediaHistoryListUI）
+     * 8.0.76 的媒体数据加载器为 com.tencent.mm.ui.chatting.presenter.n3
      */
     private fun handleMediaHistoryUI(context: Context, lpparam: XC_LoadPackage.LoadPackageParam?) {
+        // 直接拦截媒体 Presenter (n3) 的核心数据加载方法 j(boolean, int)
+        try {
+            val n3Clazz = XposedHelpers2.findClassIfExists("com.tencent.mm.ui.chatting.presenter.n3", context.classLoader)
+            if (n3Clazz != null) {
+                XposedHelpers2.findAndHookMethod(
+                    n3Clazz,
+                    "j",
+                    Boolean::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    object : XC_MethodHook2() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val talker = XposedHelpers2.getObjectField(param.thisObject, "g") as? String
+                            if (isUserLocked(talker)) {
+                                LogUtil.i("Intercept n3.j for locked talker: $talker, block data loading")
+                                param.result = null // 阻止加载真实数据
+                            }
+                        }
+                    }
+                )
+            }
+        } catch (e: Throwable) {
+            LogUtil.w("Hook presenter n3 error", e)
+        }
+
         val activities = listOf(
             MediaHistoryGalleryUI,
-            MediaHistoryListUI,
-            EmojiHistoryListUI
+            MediaHistoryListUI
         )
 
         activities.forEach { clazzName ->
@@ -161,8 +183,7 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                 XposedHelpers2.findAndHookMethod(
                     clazzName,
                     context.classLoader,
-                    "onCreate",
-                    Bundle::class.java,
+                    "initView",
                     object : XC_MethodHook2() {
                         override fun afterHookedMethod(param: MethodHookParam) {
                             val activity = param.thisObject as? Activity ?: return
@@ -172,7 +193,6 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                                 ?: intent.getStringExtra("Chat_User")
                                 ?: intent.getStringExtra("RoomInfo_Id")
 
-                            LogUtil.i("$clazzName onCreate, talker: $userName, isLocked: ${isUserLocked(userName)}")
                             if (isUserLocked(userName)) {
                                 runCatching {
                                     val recyclerView = (XposedHelpers2.getObjectField(activity, "f") as? View)
@@ -182,7 +202,7 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                                     val emptyTv = (XposedHelpers2.getObjectField(activity, "g") as? TextView)
                                         ?: (XposedHelpers2.getObjectField(activity, "m") as? TextView)
                                     emptyTv?.visibility = View.VISIBLE
-                                    emptyTv?.text = "无聊天记录"
+                                    emptyTv?.text = "无内容"
                                 }
                             }
                         }
@@ -195,7 +215,57 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
     }
 
     /**
-     * 3. 拦截多标签搜索页（包含图片、视频、文件搜索等）
+     * 3. 拦截表情历史（EmojiHistoryListUI / EmojiHistoryListFragment）
+     */
+    private fun handleEmojiHistoryUI(context: Context, lpparam: XC_LoadPackage.LoadPackageParam?) {
+        try {
+            XposedHelpers2.findAndHookMethod(
+                EmojiHistoryListFragment,
+                context.classLoader,
+                "s0",
+                java.util.List::class.java,
+                String::class.java,
+                object : XC_MethodHook2() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val talker = XposedHelpers2.getObjectField(param.thisObject, "n") as? String
+                        if (isUserLocked(talker)) {
+                            LogUtil.i("EmojiHistoryListFragment.s0 for locked talker: $talker, clear emoji list!")
+                            val list = param.args[0] as? java.util.List<*>
+                            list?.clear()
+                        }
+                    }
+                }
+            )
+
+            XposedHelpers2.findAndHookMethod(
+                EmojiHistoryListFragment,
+                context.classLoader,
+                "onViewCreated",
+                View::class.java,
+                Bundle::class.java,
+                object : XC_MethodHook2() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val talker = XposedHelpers2.getObjectField(param.thisObject, "n") as? String
+                        if (isUserLocked(talker)) {
+                            runCatching {
+                                val recyclerView = XposedHelpers2.getObjectField(param.thisObject, "p") as? View
+                                recyclerView?.visibility = View.GONE
+
+                                val emptyTv = XposedHelpers2.getObjectField(param.thisObject, "q") as? TextView
+                                emptyTv?.visibility = View.VISIBLE
+                                emptyTv?.text = "无内容"
+                            }
+                        }
+                    }
+                }
+            )
+        } catch (e: Throwable) {
+            LogUtil.w("Hook EmojiHistoryListFragment error", e)
+        }
+    }
+
+    /**
+     * 4. 拦截多标签搜索页（包含图片、视频、文件搜索等）
      */
     private fun setEmptyActionBarTabPageUI(context: Context, lpparam: XC_LoadPackage.LoadPackageParam?) {
         val hookMethodName = "s0"
@@ -223,7 +293,6 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                     }
                 )
 
-                // 补充对 onViewCreated / onActivityCreated 的空视图覆盖
                 XposedHelpers2.findAndHookMethod(
                     fragClazz,
                     context.classLoader,
