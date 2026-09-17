@@ -37,7 +37,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 /**
  * 聊天页页面处理：
  * 1、隐藏单聊/群聊聊天记录
- * 2、支持退出聊天后再次进入重新自动上锁 (兼顾 onActivityCreated / onResume / onPause / onDestroy)
+ * 2、支持退出聊天后再次进入重新自动上锁
+ * 3、精准提取 Chat_User，严禁误锁未配置的正常好友！
  */
 class EnterChattingUIPluginPart() : IPlugin {
     override fun handleHook(context: Context, lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -57,7 +58,6 @@ class EnterChattingUIPluginPart() : IPlugin {
                 object : XC_MethodHook2() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         super.afterHookedMethod(param)
-                        LogUtil.d("hook onActivityCreated")
                         enterAction.handle(param)
                     }
                 })
@@ -66,7 +66,7 @@ class EnterChattingUIPluginPart() : IPlugin {
             return
         }
 
-        // 每次进入聊天框（恢复可见）时，立即强制触发上锁逻辑
+        // 每次恢复可见或切换进入时触发
         runCatching {
             XposedHelpers2.findAndHookMethod(
                 ClazzN.BaseChattingUIFragment,
@@ -75,7 +75,6 @@ class EnterChattingUIPluginPart() : IPlugin {
                 object : XC_MethodHook2() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         super.afterHookedMethod(param)
-                        LogUtil.d("hook onResume -> re-check and lock")
                         enterAction.handle(param)
                     }
                 }
@@ -84,7 +83,7 @@ class EnterChattingUIPluginPart() : IPlugin {
             LogUtil.e("hook onResume error", it)
         }
 
-        // 退出或离开当前聊天框时，清理临时解锁状态，确保下次必须重新解锁
+        // 离开聊天界面时清理解锁状态
         runCatching {
             XposedHelpers2.findAndHookMethod(
                 ClazzN.BaseChattingUIFragment,
@@ -108,41 +107,67 @@ class EnterChattingHookAction(
     val lpparam: XC_LoadPackage.LoadPackageParam,
     val tagConst: String
 ) {
+    // 记录用户当前会话临时解锁的用户名，离开会话时清理
+    private val unlockedUsers = HashSet<String>()
+
     fun onExitChatting(fragmentObj: Any) {
         try {
-            val chatListView: View? = findChatListView(fragmentObj)
-            if (chatListView != null) {
-                // 将列表重置为不可见，清除解锁标记
-                chatListView.visibility = View.INVISIBLE
-            }
+            unlockedUsers.clear()
         } catch (e: Throwable) {
         }
     }
 
     fun handle(param: XC_MethodHook.MethodHookParam) {
         val fragmentObj = param.thisObject
-        LogUtil.w("enter chattingUI")
-        val arguments = ReflectUtil.invokeMethod(fragmentObj, "getArguments") as Bundle?
         val activity = ReflectUtil.invokeMethod(fragmentObj, "getActivity") as Activity? ?: return
 
-        if (arguments == null) {
-            LogUtil.w("chattingUI's arguments is null")
-            return
-        }
-        val chatUser = arguments.getString("Chat_User")
-        if (chatUser == null || chatUser.isEmpty()) {
-            return
+        // 多途径精准提取真实对话对象的微信号
+        var chatUser: String? = null
+
+        // 途径 1：从 Fragment 的 getArguments() 中获取
+        try {
+            val arguments = ReflectUtil.invokeMethod(fragmentObj, "getArguments") as Bundle?
+            if (arguments != null) {
+                chatUser = arguments.getString("Chat_User")
+            }
+        } catch (e: Throwable) {
         }
 
-        // 命中配置的微信号
-        if (WXMaskPlugin.containChatUser(chatUser)) {
-            hideChatListUI(fragmentObj, activity, chatUser)
+        // 途径 2：从 Activity 的 Intent 中获取
+        if (chatUser.isNullOrEmpty()) {
+            try {
+                chatUser = activity.intent?.getStringExtra("Chat_User")
+            } catch (e: Throwable) {
+            }
+        }
+
+        // 途径 3：调用 Fragment 的 getTalkerUserName() 方法
+        if (chatUser.isNullOrEmpty()) {
+            try {
+                chatUser = XposedHelpers2.callMethod<String?>(fragmentObj, "getTalkerUserName")
+            } catch (e: Throwable) {
+            }
+        }
+
+        LogUtil.i("enter chattingUI, resolved chatUser: $chatUser")
+
+        // 极其重要：只有拿到明确用户名且该用户名被添加到了配置列表，才执行遮挡！
+        // 如果不是私密好友，绝对执行 showChatListUI，绝不误挡正常好友！
+        if (!chatUser.isNullOrEmpty() && WXMaskPlugin.containChatUser(chatUser)) {
+            // 如果已经被用户本次临时解锁过，则不重复遮挡
+            if (unlockedUsers.contains(chatUser)) {
+                showChatListUI(fragmentObj)
+            } else {
+                hideChatListUI(fragmentObj, activity, chatUser)
+            }
         } else {
             showChatListUI(fragmentObj)
         }
 
-        handleUserInputMagic(activity, fragmentObj, chatUser)
-        handleShowAddMaskDialog(activity, fragmentObj, chatUser)
+        if (!chatUser.isNullOrEmpty()) {
+            handleUserInputMagic(activity, fragmentObj, chatUser)
+            handleShowAddMaskDialog(activity, fragmentObj, chatUser)
+        }
     }
 
     private fun handleShowAddMaskDialog(activity: Activity, fragmentObj: Any, chatUser: String) {
@@ -175,7 +200,7 @@ class EnterChattingHookAction(
                             ConfigUtil.removeMaskItem(chatUser)
                             val chatListView: View? = findChatListView(fragmentObj)
                             if (chatListView != null) {
-                                chatListView.visibility = View.INVISIBLE
+                                chatListView.visibility = View.VISIBLE
                             }
                         }
                         .setNeutralButton("取消") { _, _ ->
@@ -253,9 +278,8 @@ class EnterChattingHookAction(
         if (chatListView != null) {
             chatListView.visibility = View.VISIBLE
             QuickCountClickListenerUtil.unRegister(chatListView.parent as? View?)
-        } else {
-            showChatListUIFromMask(fragmentObj)
         }
+        showChatListUIFromMask(fragmentObj)
     }
 
     private fun showChatListUIFromMask(fragmentObj: Any) {
@@ -282,12 +306,14 @@ class EnterChattingHookAction(
 
             val quick = QuickTemporaryBean(ConfigUtil.getTemporaryJson() ?: JsonObject())
             QuickCountClickListenerUtil.register(chatListView.parent as? View?, quick.clickCount, quick.duration) {
+                // 点击完成解锁：恢复可见，并记录到已解锁列表
                 chatListView.visibility = View.VISIBLE
+                unlockedUsers.add(chatUser)
             }
-            LogUtil.i("hide chatListView by setVisible")
+            LogUtil.i("hide chatListView by setVisible for $chatUser")
         } else {
             hideListViewUIByMask(fragmentObj)
-            LogUtil.i("hide chatListView by add Mask")
+            LogUtil.i("hide chatListView by add Mask for $chatUser")
         }
 
         if (Constrant.WX_MASK_TIP_MODE_SILENT == maskItem.tipMode) {
