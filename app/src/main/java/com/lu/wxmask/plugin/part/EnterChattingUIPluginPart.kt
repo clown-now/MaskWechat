@@ -37,7 +37,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 /**
  * 聊天页页面处理：
  * 1、隐藏单聊/群聊聊天记录
- * 2、支持退出聊天后再次进入重新自动上锁 (onResume 状态同步)
+ * 2、支持退出聊天后再次进入重新自动上锁 (兼顾 onActivityCreated / onResume / onPause / onDestroy)
  */
 class EnterChattingUIPluginPart() : IPlugin {
     override fun handleHook(context: Context, lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -47,6 +47,7 @@ class EnterChattingUIPluginPart() : IPlugin {
     private fun handleChattingUIFragment(context: Context, lpparam: XC_LoadPackage.LoadPackageParam) {
         val tagConst = "chatting-onEnterBegin"
         val enterAction = EnterChattingHookAction(context, lpparam, tagConst)
+
         runCatching {
             XposedHelpers2.findAndHookMethod(
                 ClazzN.BaseChattingUIFragment,
@@ -65,7 +66,7 @@ class EnterChattingUIPluginPart() : IPlugin {
             return
         }
 
-        // 关键修复：Hook onResume，当用户解锁后返回主界面再重新进入对话框时，重新触发隐藏上锁！
+        // 每次进入聊天框（恢复可见）时，立即强制触发上锁逻辑
         runCatching {
             XposedHelpers2.findAndHookMethod(
                 ClazzN.BaseChattingUIFragment,
@@ -82,6 +83,23 @@ class EnterChattingUIPluginPart() : IPlugin {
         }.onFailure {
             LogUtil.e("hook onResume error", it)
         }
+
+        // 退出或离开当前聊天框时，清理临时解锁状态，确保下次必须重新解锁
+        runCatching {
+            XposedHelpers2.findAndHookMethod(
+                ClazzN.BaseChattingUIFragment,
+                context.classLoader,
+                "onPause",
+                object : XC_MethodHook2() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        super.afterHookedMethod(param)
+                        enterAction.onExitChatting(param.thisObject)
+                    }
+                }
+            )
+        }.onFailure {
+            LogUtil.e("hook onPause error", it)
+        }
     }
 }
 
@@ -90,6 +108,17 @@ class EnterChattingHookAction(
     val lpparam: XC_LoadPackage.LoadPackageParam,
     val tagConst: String
 ) {
+    fun onExitChatting(fragmentObj: Any) {
+        try {
+            val chatListView: View? = findChatListView(fragmentObj)
+            if (chatListView != null) {
+                // 将列表重置为不可见，清除解锁标记
+                chatListView.visibility = View.INVISIBLE
+            }
+        } catch (e: Throwable) {
+        }
+    }
+
     fun handle(param: XC_MethodHook.MethodHookParam) {
         val fragmentObj = param.thisObject
         LogUtil.w("enter chattingUI")
@@ -100,11 +129,11 @@ class EnterChattingHookAction(
             LogUtil.w("chattingUI's arguments is null")
             return
         }
-        LogUtil.d("hook chatting fragment arguments: ", arguments)
         val chatUser = arguments.getString("Chat_User")
         if (chatUser == null || chatUser.isEmpty()) {
             return
         }
+
         // 命中配置的微信号
         if (WXMaskPlugin.containChatUser(chatUser)) {
             hideChatListUI(fragmentObj, activity, chatUser)
@@ -130,10 +159,7 @@ class EnterChattingHookAction(
         }
 
         userInputView.addTextChangedListener {
-            val editable = it
-            if (editable == null) {
-                return@addTextChangedListener
-            }
+            val editable = it ?: return@addTextChangedListener
             val text = editable.toElseEmptyString()
             when (text) {
                 "#add" -> {
@@ -176,18 +202,9 @@ class EnterChattingHookAction(
         }
     }
 
-    private fun isUserInputCopyId(fragmentObj: Any): Boolean {
-        return "#copyId" == getUserChatEditText(fragmentObj).toElseEmptyString()
-    }
-
-    /**
-     * 获取用户输入框
-     */
     private fun getUserChatEditText(fragmentObj: Any): EditText? {
         return XposedHelpers2.callMethod<View?>(fragmentObj, "findViewById", ResUtil.getViewId("bkk"))?.let {
-            LogUtil.d("MMFlexEditText", it)
             ChildDeepCheck().filter(it) { child ->
-                LogUtil.d("MMEditText", child)
                 child is EditText
             }?.firstOrNull()?.let {
                 it as EditText
@@ -211,7 +228,6 @@ class EnterChattingHookAction(
                     }
                 XposedHelpers2.callMethod(fragmentObj, "findViewById", mmListViewId) as View
             }.getOrNull()
-
         }
         if (listView == null) {
             listView = runCatching {
@@ -228,9 +244,7 @@ class EnterChattingHookAction(
                     mmListView as View
                 }
             }.getOrNull()
-            LogUtil.w("guess ChatListView for：", listView)
         }
-        LogUtil.d("find ChatListView result：", listView)
         return listView
     }
 
@@ -281,7 +295,6 @@ class EnterChattingHookAction(
         } else if (Constrant.CONFIG_TIP_MODE_ALERT == maskItem.tipMode) {
             handleAlertMode(activity, maskItem)
         }
-
     }
 
     private fun handleAlertMode(uiContext: Context, item: MaskItemBean) {
