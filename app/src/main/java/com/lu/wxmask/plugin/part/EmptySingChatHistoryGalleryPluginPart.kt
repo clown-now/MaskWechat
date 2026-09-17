@@ -69,7 +69,6 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                     val userName = act.intent?.getStringExtra("Chat_User")
                         ?: act.intent?.getStringExtra("detail_username")
                     if (isUserLocked(userName)) {
-                        // 未解锁：清空数据或 finish
                         act.finish()
                     }
                 }
@@ -79,7 +78,7 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
 
     /**
      * 1. 拦截“按日期查找聊天记录”
-     * 可以点进去查看日历，但如果未解锁，不向数据库查询可点击日期（数据全空，显示无记录）；解锁后正常加载！
+     * 未解锁状态下，在 onCreate 之后以及异步数据准备好时彻底清空记录，显示无聊天记录
      */
     private fun handleSelectDateUI(context: Context, lpparam: XC_LoadPackage.LoadPackageParam?) {
         try {
@@ -96,25 +95,54 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                             ?: intent.getStringExtra("kintent_talker")
                             ?: intent.getStringExtra("Chat_User")
 
+                        LogUtil.i("SelectDateUI onCreate, talker: $userName, isLocked: ${isUserLocked(userName)}")
                         if (isUserLocked(userName)) {
-                            // 未解锁：清空已准备的日期 Map，并显示空提示
-                            runCatching {
-                                val dateMap = XposedHelpers2.getObjectField(activity, "f") as? java.util.HashMap<*, *>
-                                dateMap?.clear()
-                                // 隐藏日历主体，或者将无记录文本设为可见
-                                val emptyTv = XposedHelpers2.getObjectField(activity, "m") as? TextView
-                                emptyTv?.visibility = View.VISIBLE
-                                emptyTv?.text = "无聊天记录"
-                                
-                                val dayPickerView = XposedHelpers2.getObjectField(activity, "d") as? View
-                                dayPickerView?.visibility = View.GONE
-                            }
+                            applyDateEmptyUI(activity)
                         }
                     }
                 }
             )
+
+            // SelectDateUI 异步加载数据用的 Runnable 是 com.tencent.mm.chatroom.ui.lc
+            // 当 run() 结束时再次清空，防止被异步数据覆盖！
+            val lcClazz = XposedHelpers2.findClassIfExists("com.tencent.mm.chatroom.ui.lc", context.classLoader)
+            if (lcClazz != null) {
+                XposedHelpers2.findAndHookMethod(
+                    lcClazz,
+                    "run",
+                    object : XC_MethodHook2() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            val uiObj = XposedHelpers2.getObjectField(param.thisObject, "d") as? Activity ?: return
+                            val intent = uiObj.intent ?: return
+                            val userName = intent.getStringExtra("detail_username")
+                                ?: intent.getStringExtra("kintent_talker")
+                                ?: intent.getStringExtra("Chat_User")
+                            if (isUserLocked(userName)) {
+                                LogUtil.i("SelectDateUI.lc.run finished, force empty for $userName")
+                                applyDateEmptyUI(uiObj)
+                            }
+                        }
+                    }
+                )
+            }
         } catch (e: Throwable) {
             LogUtil.w("Hook SelectDateUI error", e)
+        }
+    }
+
+    private fun applyDateEmptyUI(activity: Activity) {
+        runCatching {
+            val dateMap = XposedHelpers2.getObjectField(activity, "f") as? java.util.HashMap<*, *>
+            dateMap?.clear()
+
+            // 隐藏日历主体
+            val dayPickerView = XposedHelpers2.getObjectField(activity, "d") as? View
+            dayPickerView?.visibility = View.GONE
+
+            // 显示无聊天记录 TextView
+            val emptyTv = XposedHelpers2.getObjectField(activity, "m") as? TextView
+            emptyTv?.visibility = View.VISIBLE
+            emptyTv?.text = "无聊天记录"
         }
     }
 
@@ -144,14 +172,13 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                                 ?: intent.getStringExtra("Chat_User")
                                 ?: intent.getStringExtra("RoomInfo_Id")
 
+                            LogUtil.i("$clazzName onCreate, talker: $userName, isLocked: ${isUserLocked(userName)}")
                             if (isUserLocked(userName)) {
-                                // 未解锁状态：隐藏 RecyclerView 列表，展示空数据提示
                                 runCatching {
                                     val recyclerView = (XposedHelpers2.getObjectField(activity, "f") as? View)
                                         ?: (XposedHelpers2.getObjectField(activity, "g") as? View)
                                     recyclerView?.visibility = View.GONE
 
-                                    // 显示空提示 TextView（若存在）
                                     val emptyTv = (XposedHelpers2.getObjectField(activity, "g") as? TextView)
                                         ?: (XposedHelpers2.getObjectField(activity, "m") as? TextView)
                                     emptyTv?.visibility = View.VISIBLE
@@ -188,38 +215,39 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                         override fun beforeHookedMethod(param: MethodHookParam) {
                             if (!ConfigUtil.getOptionData().hideSingleSearch) return
                             if (isHitMaskId(param.thisObject)) {
+                                LogUtil.i("$fragClazz.$hookMethodName invoked for locked user, clear results!")
                                 val arrayList = param.args[0] as? java.util.ArrayList<*>
                                 arrayList?.clear()
                             }
                         }
                     }
                 )
-            } catch (e: Throwable) {
-            }
-        }
 
-        // tab==图片
-        try {
-            XposedHelpers2.findAndHookMethod(
-                "com.tencent.mm.ui.chatting.search.multi.fragment.FTSMultiImageResultFragment",
-                context.classLoader,
-                "onCreateView",
-                LayoutInflater::class.java,
-                ViewGroup::class.java,
-                Bundle::class.java,
-                object : XC_MethodHook2() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        if (!ConfigUtil.getOptionData().hideSingleSearch) return
-                        if (isHitMaskId(param.thisObject)) {
-                            val inflater = param.args[0] as LayoutInflater
-                            val viewGroup: ViewGroup = param.args[1] as ViewGroup
-                            val layoutId = XposedHelpers2.callMethod<Int>(param.thisObject, "getLayoutId")
-                            param.result = inflater.inflate(layoutId, viewGroup, false)
+                // 补充对 onViewCreated / onActivityCreated 的空视图覆盖
+                XposedHelpers2.findAndHookMethod(
+                    fragClazz,
+                    context.classLoader,
+                    "onActivityCreated",
+                    Bundle::class.java,
+                    object : XC_MethodHook2() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            if (!ConfigUtil.getOptionData().hideSingleSearch) return
+                            if (isHitMaskId(param.thisObject)) {
+                                runCatching {
+                                    val recyclerView = XposedHelpers2.getObjectField(param.thisObject, "o") as? View
+                                    recyclerView?.visibility = View.GONE
+
+                                    val emptyTv = XposedHelpers2.getObjectField(param.thisObject, "p") as? TextView
+                                    emptyTv?.visibility = View.VISIBLE
+                                    emptyTv?.text = "无搜索结果"
+                                }
+                            }
                         }
                     }
-                }
-            )
-        } catch (e: Throwable) {
+                )
+            } catch (e: Throwable) {
+                LogUtil.w("Hook multi search fragment $fragClazz error", e)
+            }
         }
     }
 
