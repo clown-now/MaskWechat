@@ -145,8 +145,7 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
     }
 
     /**
-     * 2. 拦截图片/视频历史（MediaHistoryGalleryUI）与文件历史（MediaHistoryListUI）
-     * 8.0.76 的媒体数据加载器为 com.tencent.mm.ui.chatting.presenter.n3
+     * 2. 拦截图片/视频历史（MediaHistoryGalleryUI）与文件/链接等历史（MediaHistoryListUI）
      */
     private fun handleMediaHistoryUI(context: Context, lpparam: XC_LoadPackage.LoadPackageParam?) {
         // 直接拦截媒体 Presenter (n3) 的核心数据加载方法 j(boolean, int)
@@ -163,7 +162,7 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                             val talker = XposedHelpers2.getObjectField(param.thisObject, "g") as? String
                             if (isUserLocked(talker)) {
                                 LogUtil.i("Intercept n3.j for locked talker: $talker, block data loading")
-                                param.result = null // 阻止加载真实数据
+                                param.result = null
                             }
                         }
                     }
@@ -283,7 +282,6 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                     java.util.ArrayList::class.java,
                     object : XC_MethodHook2() {
                         override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (!ConfigUtil.getOptionData().hideSingleSearch) return
                             if (isHitMaskId(param.thisObject)) {
                                 LogUtil.i("$fragClazz.$hookMethodName invoked for locked user, clear results!")
                                 val arrayList = param.args[0] as? java.util.ArrayList<*>
@@ -300,7 +298,6 @@ class EmptySingChatHistoryGalleryPluginPart : IPlugin {
                     Bundle::class.java,
                     object : XC_MethodHook2() {
                         override fun afterHookedMethod(param: MethodHookParam) {
-                            if (!ConfigUtil.getOptionData().hideSingleSearch) return
                             if (isHitMaskId(param.thisObject)) {
                                 runCatching {
                                     val recyclerView = XposedHelpers2.getObjectField(param.thisObject, "o") as? View
